@@ -1119,7 +1119,7 @@ func splitConfigKey(input string) (string, string, error) {
 }
 
 func printUsage() {
-	fmt.Println(`gitcnf manages multiple Git identities, SSH aliases, repo bindings, and plain git config values.
+	fmt.Print(`gitcnf manages multiple Git identities, SSH aliases, repo bindings, and plain git config values.
 
 Usage:
   gitcnf [--db path] <command> [options]

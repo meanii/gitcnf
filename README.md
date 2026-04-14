@@ -21,6 +21,8 @@ This project is aimed at the real problem of using multiple GitHub, Bitbucket, o
 - repo binding management
 - SSH config rendering
 - remote URL rewriting for SSH aliases
+- Go test coverage for core workflows
+- GitHub Actions CI and tagged release builds for Linux amd64 and arm64
 
 ## Install
 
@@ -131,9 +133,32 @@ These still exist:
 ./gitcnf profile use personal
 ```
 
+## CI and release automation
+
+GitHub Actions included:
+
+- `.github/workflows/ci.yml`
+  - runs tests on pushes and pull requests
+  - builds the project on Go 1.25 and 1.26
+
+- `.github/workflows/release.yml`
+  - runs on tags like `v0.1.0`
+  - builds release tarballs for:
+    - Linux amd64
+    - Linux arm64
+  - uploads them to the GitHub release automatically
+
+To cut a release:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## Notes
 
 - `bind apply` expects the repo remote to already be an SSH remote
 - current remote rewriting supports common `git@host:org/repo.git` and `ssh://git@host/org/repo.git` formats
 - `bind apply --write-ssh-config` appends a host block if it does not already exist
+- release builds use `CGO_ENABLED=0`, so if the SQLite driver later requires CGO for your chosen implementation, release packaging may need adjustment
 - data is stored in SQLite by default at `~/.gitcnf/gitcnf.db`
