@@ -1,0 +1,4 @@
+gitcnf
+*.db
+*.sqlite
+*.sqlite3
