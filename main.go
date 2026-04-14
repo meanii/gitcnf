@@ -24,6 +24,17 @@ type ConfigEntry struct {
 	UpdatedAt string
 }
 
+type ProfileEntry struct {
+	ID          int64
+	ProfileName string
+	Scope       string
+	Section     string
+	Key         string
+	Value       string
+	CreatedAt   string
+	UpdatedAt   string
+}
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -67,6 +78,8 @@ func run(args []string) error {
 		return cmdApply(db, remaining[1:])
 	case "export":
 		return cmdExport(db, remaining[1:])
+	case "profile":
+		return cmdProfile(db, remaining[1:])
 	case "help":
 		printUsage()
 		return nil
@@ -135,6 +148,17 @@ CREATE TABLE IF NOT EXISTS config_entries (
     updated_at TEXT NOT NULL,
     UNIQUE(scope, section, key_name)
 );
+CREATE TABLE IF NOT EXISTS profile_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_name TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    section TEXT NOT NULL,
+    key_name TEXT NOT NULL,
+    value TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(profile_name, scope, section, key_name)
+);
 `
 	_, err := db.Exec(schema)
 	if err != nil {
@@ -163,16 +187,9 @@ func cmdSet(db *sql.DB, args []string) error {
 		return err
 	}
 	value := fs.Arg(1)
-	now := time.Now().UTC().Format(time.RFC3339)
 
-	_, err = db.Exec(`
-INSERT INTO config_entries (scope, section, key_name, value, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?)
-ON CONFLICT(scope, section, key_name)
-DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at;
-`, *scope, section, key, value, now, now)
-	if err != nil {
-		return fmt.Errorf("save config: %w", err)
+	if err := upsertConfigEntry(db, *scope, section, key, value); err != nil {
+		return err
 	}
 
 	fmt.Printf("saved %s.%s for %s scope\n", section, key, *scope)
@@ -194,13 +211,9 @@ func cmdGet(db *sql.DB, args []string) error {
 		return err
 	}
 
-	var value string
-	err = db.QueryRow(`SELECT value FROM config_entries WHERE scope = ? AND section = ? AND key_name = ?`, *scope, section, key).Scan(&value)
+	value, err := getConfigValue(db, *scope, section, key)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("config %s.%s not found for %s scope", section, key, *scope)
-		}
-		return fmt.Errorf("read config: %w", err)
+		return err
 	}
 
 	fmt.Println(value)
@@ -284,39 +297,14 @@ func cmdApply(db *sql.DB, args []string) error {
 		return err
 	}
 
-	rows, err := db.Query(`SELECT section, key_name, value FROM config_entries WHERE scope = ? ORDER BY section, key_name`, *scope)
+	entries, err := loadConfigEntries(db, *scope)
 	if err != nil {
-		return fmt.Errorf("query configs: %w", err)
+		return err
 	}
-	defer rows.Close()
 
-	applied := 0
-	for rows.Next() {
-		var section, key, value string
-		if err := rows.Scan(&section, &key, &value); err != nil {
-			return fmt.Errorf("scan config: %w", err)
-		}
-
-		gitArgs := []string{"config"}
-		if *scope == "global" {
-			gitArgs = append(gitArgs, "--global")
-		} else if *scope == "local" {
-			gitArgs = append(gitArgs, "--local")
-		} else {
-			return fmt.Errorf("unsupported scope %q", *scope)
-		}
-		gitArgs = append(gitArgs, section+"."+key, value)
-
-		cmd := exec.Command("git", gitArgs...)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("apply %s.%s: %w", section, key, err)
-		}
-		applied++
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate configs: %w", err)
+	applied, err := applyEntries(entries, *scope)
+	if err != nil {
+		return err
 	}
 
 	fmt.Printf("applied %d config entries to git %s scope\n", applied, *scope)
@@ -355,6 +343,310 @@ func cmdExport(db *sql.DB, args []string) error {
 	return rows.Err()
 }
 
+func cmdProfile(db *sql.DB, args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: gitcnf profile <save|use|list|show|delete> [options]")
+	}
+
+	switch args[0] {
+	case "save":
+		return cmdProfileSave(db, args[1:])
+	case "use":
+		return cmdProfileUse(db, args[1:])
+	case "list":
+		return cmdProfileList(db, args[1:])
+	case "show":
+		return cmdProfileShow(db, args[1:])
+	case "delete", "remove", "rm":
+		return cmdProfileDelete(db, args[1:])
+	default:
+		return fmt.Errorf("unknown profile command %q", args[0])
+	}
+}
+
+func cmdProfileSave(db *sql.DB, args []string) error {
+	fs := flag.NewFlagSet("profile save", flag.ContinueOnError)
+	scope := fs.String("scope", "global", "scope to save into the profile")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("usage: gitcnf profile save [--scope global|local] <name>")
+	}
+
+	profileName := fs.Arg(0)
+	entries, err := loadConfigEntries(db, *scope)
+	if err != nil {
+		return err
+	}
+	if len(entries) == 0 {
+		return fmt.Errorf("no saved configs found for %s scope", *scope)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := db.Exec(`DELETE FROM profile_entries WHERE profile_name = ?`, profileName); err != nil {
+		return fmt.Errorf("clear existing profile: %w", err)
+	}
+
+	for _, entry := range entries {
+		_, err := db.Exec(`
+INSERT INTO profile_entries (profile_name, scope, section, key_name, value, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+`, profileName, entry.Scope, entry.Section, entry.Key, entry.Value, now, now)
+		if err != nil {
+			return fmt.Errorf("save profile entry %s.%s: %w", entry.Section, entry.Key, err)
+		}
+	}
+
+	fmt.Printf("saved profile %q with %d entries from %s scope\n", profileName, len(entries), *scope)
+	return nil
+}
+
+func cmdProfileUse(db *sql.DB, args []string) error {
+	fs := flag.NewFlagSet("profile use", flag.ContinueOnError)
+	applyToGit := fs.Bool("apply", false, "apply the profile to git after loading it")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("usage: gitcnf profile use [--apply] <name>")
+	}
+
+	profileName := fs.Arg(0)
+	entries, err := loadProfileEntries(db, profileName)
+	if err != nil {
+		return err
+	}
+	if len(entries) == 0 {
+		return fmt.Errorf("profile %q not found", profileName)
+	}
+
+	for _, entry := range entries {
+		if err := upsertConfigEntry(db, entry.Scope, entry.Section, entry.Key, entry.Value); err != nil {
+			return err
+		}
+	}
+
+	fmt.Printf("loaded profile %q into active config store (%d entries)\n", profileName, len(entries))
+	if *applyToGit {
+		appliedByScope := map[string]int{}
+		for _, scope := range []string{"global", "local"} {
+			scopeEntries := filterProfileEntriesByScope(entries, scope)
+			if len(scopeEntries) == 0 {
+				continue
+			}
+			applied, err := applyEntries(scopeEntries, scope)
+			if err != nil {
+				return err
+			}
+			appliedByScope[scope] = applied
+		}
+		for _, scope := range []string{"global", "local"} {
+			if count, ok := appliedByScope[scope]; ok {
+				fmt.Printf("applied %d profile entries to git %s scope\n", count, scope)
+			}
+		}
+	}
+	return nil
+}
+
+func cmdProfileList(db *sql.DB, args []string) error {
+	fs := flag.NewFlagSet("profile list", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	rows, err := db.Query(`
+SELECT profile_name, COUNT(*)
+FROM profile_entries
+GROUP BY profile_name
+ORDER BY profile_name
+`)
+	if err != nil {
+		return fmt.Errorf("list profiles: %w", err)
+	}
+	defer rows.Close()
+
+	found := false
+	for rows.Next() {
+		found = true
+		var name string
+		var count int
+		if err := rows.Scan(&name, &count); err != nil {
+			return fmt.Errorf("scan profile: %w", err)
+		}
+		fmt.Printf("%s (%d entries)\n", name, count)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate profiles: %w", err)
+	}
+	if !found {
+		fmt.Println("no saved profiles")
+	}
+	return nil
+}
+
+func cmdProfileShow(db *sql.DB, args []string) error {
+	fs := flag.NewFlagSet("profile show", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("usage: gitcnf profile show <name>")
+	}
+
+	entries, err := loadProfileEntries(db, fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	if len(entries) == 0 {
+		return fmt.Errorf("profile %q not found", fs.Arg(0))
+	}
+
+	for _, entry := range entries {
+		fmt.Printf("[%s] %s.%s=%s\n", entry.Scope, entry.Section, entry.Key, entry.Value)
+	}
+	return nil
+}
+
+func cmdProfileDelete(db *sql.DB, args []string) error {
+	fs := flag.NewFlagSet("profile delete", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("usage: gitcnf profile delete <name>")
+	}
+
+	result, err := db.Exec(`DELETE FROM profile_entries WHERE profile_name = ?`, fs.Arg(0))
+	if err != nil {
+		return fmt.Errorf("delete profile: %w", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("delete profile rows affected: %w", err)
+	}
+	if count == 0 {
+		return fmt.Errorf("profile %q not found", fs.Arg(0))
+	}
+
+	fmt.Printf("deleted profile %q\n", fs.Arg(0))
+	return nil
+}
+
+func upsertConfigEntry(db *sql.DB, scope, section, key, value string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := db.Exec(`
+INSERT INTO config_entries (scope, section, key_name, value, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(scope, section, key_name)
+DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at;
+`, scope, section, key, value, now, now)
+	if err != nil {
+		return fmt.Errorf("save config: %w", err)
+	}
+	return nil
+}
+
+func getConfigValue(db *sql.DB, scope, section, key string) (string, error) {
+	var value string
+	err := db.QueryRow(`SELECT value FROM config_entries WHERE scope = ? AND section = ? AND key_name = ?`, scope, section, key).Scan(&value)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", fmt.Errorf("config %s.%s not found for %s scope", section, key, scope)
+		}
+		return "", fmt.Errorf("read config: %w", err)
+	}
+	return value, nil
+}
+
+func loadConfigEntries(db *sql.DB, scope string) ([]ConfigEntry, error) {
+	rows, err := db.Query(`SELECT id, scope, section, key_name, value, created_at, updated_at FROM config_entries WHERE scope = ? ORDER BY section, key_name`, scope)
+	if err != nil {
+		return nil, fmt.Errorf("query configs: %w", err)
+	}
+	defer rows.Close()
+
+	entries := []ConfigEntry{}
+	for rows.Next() {
+		var entry ConfigEntry
+		if err := rows.Scan(&entry.ID, &entry.Scope, &entry.Section, &entry.Key, &entry.Value, &entry.CreatedAt, &entry.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan config: %w", err)
+		}
+		entries = append(entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate configs: %w", err)
+	}
+	return entries, nil
+}
+
+func loadProfileEntries(db *sql.DB, profileName string) ([]ProfileEntry, error) {
+	rows, err := db.Query(`
+SELECT id, profile_name, scope, section, key_name, value, created_at, updated_at
+FROM profile_entries
+WHERE profile_name = ?
+ORDER BY scope, section, key_name
+`, profileName)
+	if err != nil {
+		return nil, fmt.Errorf("query profile: %w", err)
+	}
+	defer rows.Close()
+
+	entries := []ProfileEntry{}
+	for rows.Next() {
+		var entry ProfileEntry
+		if err := rows.Scan(&entry.ID, &entry.ProfileName, &entry.Scope, &entry.Section, &entry.Key, &entry.Value, &entry.CreatedAt, &entry.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan profile entry: %w", err)
+		}
+		entries = append(entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate profile entries: %w", err)
+	}
+	return entries, nil
+}
+
+func filterProfileEntriesByScope(entries []ProfileEntry, scope string) []ConfigEntry {
+	filtered := make([]ConfigEntry, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Scope != scope {
+			continue
+		}
+		filtered = append(filtered, ConfigEntry{
+			Scope:   entry.Scope,
+			Section: entry.Section,
+			Key:     entry.Key,
+			Value:   entry.Value,
+		})
+	}
+	return filtered
+}
+
+func applyEntries(entries []ConfigEntry, scope string) (int, error) {
+	applied := 0
+	for _, entry := range entries {
+		gitArgs := []string{"config"}
+		if scope == "global" {
+			gitArgs = append(gitArgs, "--global")
+		} else if scope == "local" {
+			gitArgs = append(gitArgs, "--local")
+		} else {
+			return 0, fmt.Errorf("unsupported scope %q", scope)
+		}
+		gitArgs = append(gitArgs, entry.Section+"."+entry.Key, entry.Value)
+
+		cmd := exec.Command("git", gitArgs...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return 0, fmt.Errorf("apply %s.%s: %w", entry.Section, entry.Key, err)
+		}
+		applied++
+	}
+	return applied, nil
+}
+
 func scopeFlag(scope string) string {
 	switch scope {
 	case "global":
@@ -383,19 +675,25 @@ Usage:
   gitcnf [--db path] <command> [options]
 
 Commands:
-  init                         Initialize the SQLite database
-  set [--scope s] key value    Save a config value
-  get [--scope s] key          Read a saved config value
-  list [--scope s]             List saved configs
-  remove [--scope s] key       Delete a saved config
-  apply [--scope s]            Apply saved configs using git config
-  export [--scope s]           Export saved configs as git commands
-  help                         Show this help
+  init                             Initialize the SQLite database
+  set [--scope s] key value        Save a config value
+  get [--scope s] key              Read a saved config value
+  list [--scope s]                 List saved configs
+  remove [--scope s] key           Delete a saved config
+  apply [--scope s]                Apply saved configs using git config
+  export [--scope s]               Export saved configs as git commands
+  profile save [--scope s] name    Save current scope entries as a named profile
+  profile use [--apply] name       Load a named profile into active configs
+  profile list                     List saved profiles
+  profile show name                Show entries in a saved profile
+  profile delete name              Delete a saved profile
+  help                             Show this help
 
 Examples:
   gitcnf set --scope global user.name "Anii"
   gitcnf set --scope global user.email "me@example.com"
+  gitcnf profile save work
+  gitcnf profile use --apply work
   gitcnf list
-  gitcnf apply --scope global
 `)
 }
